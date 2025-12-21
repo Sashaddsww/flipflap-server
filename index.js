@@ -1,7 +1,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
+const https = require('https');
 
-// Инициализация Firebase Admin
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 admin.initializeApp({
@@ -15,50 +15,63 @@ const messaging = admin.messaging();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Health check
 app.get('/', (req, res) => {
-    res.send('FlipFlap Server is running!');
+    res.json({ status: 'running', time: new Date().toISOString() });
 });
 
-// Слушаем новые сообщения
+// Храним отправленные уведомления
+const sentMessages = new Set();
+
+// Очищаем каждый час
+setInterval(() => {
+    sentMessages.clear();
+    console.log('Cache cleared');
+}, 60 * 60 * 1000);
+
+// Храним активные listeners чтобы не дублировать
+const activeListeners = new Set();
+
 function startListening() {
-    console.log('Starting to listen for new messages...');
+    console.log('Starting listener...');
     
-    const messagesRef = db.ref('messages');
-    
-    messagesRef.on('child_added', (chatSnapshot) => {
-        const chatId = chatSnapshot.key;
+    // Слушаем ВСЕ сообщения одним listener'ом
+    db.ref('messages').on('child_added', (chatSnap) => {
+        const chatId = chatSnap.key;
         
-        // Слушаем сообщения в каждом чате
-        db.ref(`messages/${chatId}`).on('child_added', async (msgSnapshot) => {
-            const message = msgSnapshot.val();
-            const messageId = msgSnapshot.key;
-            
-            // Проверяем, новое ли сообщение (не старше 30 секунд)
-            const now = Date.now();
-            if (!message.time || now - message.time > 30000) {
-                return;
-            }
-            
-            await sendNotification(chatId, message);
-        });
+        // Проверяем, не слушаем ли уже этот чат
+        if (activeListeners.has(chatId)) {
+            return;
+        }
+        activeListeners.add(chatId);
+        
+        // Слушаем только НОВЫЕ сообщения (после текущего времени)
+        const startTime = Date.now();
+        
+        db.ref('messages/' + chatId)
+            .orderByChild('time')
+            .startAt(startTime)
+            .on('child_added', (msgSnap) => {
+                handleNewMessage(chatId, msgSnap.key, msgSnap.val());
+            });
     });
     
-    // Также слушаем новые чаты
-    db.ref('chats').on('child_added', (chatSnapshot) => {
-        const chatId = chatSnapshot.key;
-        
-        db.ref(`messages/${chatId}`).on('child_added', async (msgSnapshot) => {
-            const message = msgSnapshot.val();
-            
-            const now = Date.now();
-            if (!message.time || now - message.time > 30000) {
-                return;
-            }
-            
-            await sendNotification(chatId, message);
-        });
-    });
+    console.log('Listener started!');
+}
+
+async function handleNewMessage(chatId, messageId, message) {
+    // Уникальный ключ для проверки дубликатов
+    const key = chatId + '_' + messageId;
+    
+    // Если уже отправляли - пропускаем
+    if (sentMessages.has(key)) {
+        return;
+    }
+    
+    // Сразу добавляем в отправленные
+    sentMessages.add(key);
+    
+    // Отправляем уведомление
+    await sendNotification(chatId, message);
 }
 
 async function sendNotification(chatId, message) {
@@ -71,7 +84,7 @@ async function sendNotification(chatId, message) {
         }
         
         // Получаем чат
-        const chatSnap = await db.ref(`chats/${chatId}`).once('value');
+        const chatSnap = await db.ref('chats/' + chatId).once('value');
         const chat = chatSnap.val();
         
         if (!chat || !chat.members) {
@@ -97,61 +110,61 @@ async function sendNotification(chatId, message) {
         }
         
         // Получаем данные получателя
-        const receiverSnap = await db.ref(`users/${receiverId}`).once('value');
+        const receiverSnap = await db.ref('users/' + receiverId).once('value');
         const receiver = receiverSnap.val();
         
         if (!receiver || !receiver.fcmToken) {
-            console.log('No FCM token for receiver:', receiverId);
+            console.log('No token for: ' + receiverId);
             return;
         }
         
-        // Не отправляем если получатель онлайн
-        // (можно убрать если хотите всегда отправлять)
-        // if (receiver.online === true) {
-        //     return;
-        // }
-        
         // Получаем имя отправителя
-        const senderSnap = await db.ref(`users/${senderId}/name`).once('value');
-        const senderName = senderSnap.val() || 'Новое сообщение';
+        const senderSnap = await db.ref('users/' + senderId + '/name').once('value');
+        const senderName = senderSnap.val() || 'Сообщение';
         
-        // Формируем уведомление
-        const payload = {
+        // Отправляем
+        await messaging.send({
             notification: {
                 title: senderName,
-                body: text.length > 100 ? text.substring(0, 100) + '...' : text
+                body: text.length > 100 ? text.slice(0, 100) + '...' : text
             },
             data: {
-                title: senderName,
-                body: text,
                 chatId: chatId,
                 senderId: senderId
             },
             android: {
                 priority: 'high',
-                notification: {
+                notification: { 
                     sound: 'default',
-                    clickAction: 'OPEN_CHAT'
+                    channelId: 'messages'
                 }
             },
             token: receiver.fcmToken
-        };
+        });
         
-        const response = await messaging.send(payload);
-        console.log('Notification sent:', senderName, '->', receiver.name);
+        console.log('OK: ' + senderName + ' -> ' + receiver.name + ': ' + text.slice(0, 30));
         
-    } catch (error) {
-        if (error.code === 'messaging/registration-token-not-registered') {
-            console.log('Token expired, removing...');
-            // Можно удалить невалидный токен
+    } catch (err) {
+        if (err.code === 'messaging/registration-token-not-registered') {
+            console.log('Token expired');
         } else {
-            console.error('Error sending notification:', error.message);
+            console.error('Error: ' + err.message);
         }
     }
 }
 
-// Запуск сервера
+// Keep alive
+function keepAlive() {
+    const url = process.env.RENDER_EXTERNAL_URL;
+    if (url) {
+        setInterval(() => {
+            https.get(url, () => {}).on('error', () => {});
+        }, 14 * 60 * 1000);
+    }
+}
+
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log('Server on port ' + PORT);
     startListening();
+    keepAlive();
 });
