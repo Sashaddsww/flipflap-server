@@ -28,69 +28,78 @@ setInterval(() => {
     console.log('Cache cleared');
 }, 60 * 60 * 1000);
 
-// Храним активные listeners чтобы не дублировать
-const activeListeners = new Set();
-
 function startListening() {
     console.log('Starting listener...');
     
-    // Слушаем ВСЕ сообщения одним listener'ом
+    // Слушаем ВСЕ сообщения напрямую
     db.ref('messages').on('child_added', (chatSnap) => {
         const chatId = chatSnap.key;
-        
-        // Проверяем, не слушаем ли уже этот чат
-        if (activeListeners.has(chatId)) {
-            return;
-        }
-        activeListeners.add(chatId);
-        
-        // Слушаем только НОВЫЕ сообщения (после текущего времени)
-        const startTime = Date.now();
-        
-        db.ref('messages/' + chatId)
-            .orderByChild('time')
-            .startAt(startTime)
-            .on('child_added', (msgSnap) => {
-                handleNewMessage(chatId, msgSnap.key, msgSnap.val());
-            });
+        console.log('New chat detected: ' + chatId);
+        listenToChat(chatId);
+    });
+
+    // Также слушаем уже существующие чаты
+    db.ref('messages').once('value', (snap) => {
+        snap.forEach((chatSnap) => {
+            const chatId = chatSnap.key;
+            listenToChat(chatId);
+        });
+        console.log('Listening to ' + snap.numChildren() + ' existing chats');
     });
     
     console.log('Listener started!');
 }
 
-async function handleNewMessage(chatId, messageId, message) {
-    // Уникальный ключ для проверки дубликатов
-    const key = chatId + '_' + messageId;
-    
-    // Если уже отправляли - пропускаем
-    if (sentMessages.has(key)) {
+// Храним активные listeners
+const activeListeners = new Set();
+
+function listenToChat(chatId) {
+    if (activeListeners.has(chatId)) {
         return;
     }
-    
-    // Сразу добавляем в отправленные
-    sentMessages.add(key);
-    
-    // Отправляем уведомление
-    await sendNotification(chatId, message);
+    activeListeners.add(chatId);
+
+    // Слушаем ВСЕ новые сообщения в этом чате
+    db.ref('messages/' + chatId).on('child_added', (msgSnap) => {
+        const message = msgSnap.val();
+        const messageId = msgSnap.key;
+
+        // Проверяем что сообщение новое (не старше 60 секунд)
+        const now = Date.now();
+        if (message.time && (now - message.time > 60000)) {
+            return;
+        }
+
+        // Уникальный ключ
+        const key = chatId + '_' + messageId;
+        if (sentMessages.has(key)) {
+            return;
+        }
+        sentMessages.add(key);
+
+        // Отправляем уведомление
+        sendNotification(chatId, message);
+    });
 }
 
 async function sendNotification(chatId, message) {
     try {
         const senderId = message.senderId;
         const text = message.text;
-        
+
         if (!senderId || !text) {
             return;
         }
-        
+
         // Получаем чат
         const chatSnap = await db.ref('chats/' + chatId).once('value');
         const chat = chatSnap.val();
-        
+
         if (!chat || !chat.members) {
+            console.log('Chat not found: ' + chatId);
             return;
         }
-        
+
         // Находим получателя
         let receiverId = null;
         for (const uid in chat.members) {
@@ -99,29 +108,29 @@ async function sendNotification(chatId, message) {
                 break;
             }
         }
-        
+
         if (!receiverId) {
             return;
         }
-        
+
         // Проверяем deletedFor
         if (message.deletedFor && message.deletedFor[receiverId]) {
             return;
         }
-        
+
         // Получаем данные получателя
         const receiverSnap = await db.ref('users/' + receiverId).once('value');
         const receiver = receiverSnap.val();
-        
+
         if (!receiver || !receiver.fcmToken) {
             console.log('No token for: ' + receiverId);
             return;
         }
-        
+
         // Получаем имя отправителя
         const senderSnap = await db.ref('users/' + senderId + '/name').once('value');
         const senderName = senderSnap.val() || 'Сообщение';
-        
+
         // Отправляем
         await messaging.send({
             notification: {
@@ -134,16 +143,16 @@ async function sendNotification(chatId, message) {
             },
             android: {
                 priority: 'high',
-                notification: { 
+                notification: {
                     sound: 'default',
                     channelId: 'messages'
                 }
             },
             token: receiver.fcmToken
         });
-        
+
         console.log('OK: ' + senderName + ' -> ' + receiver.name + ': ' + text.slice(0, 30));
-        
+
     } catch (err) {
         if (err.code === 'messaging/registration-token-not-registered') {
             console.log('Token expired');
