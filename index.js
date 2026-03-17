@@ -91,26 +91,39 @@ async function sendCallNotification(callId, call) {
         const receiverId = call.receiverId;
         const isVideo = call.isVideo || false;
         
+        console.log('>>> Sending call notification');
+        console.log('>>> Caller:', callerId);
+        console.log('>>> Receiver:', receiverId);
+        
         if (!callerId || !receiverId) {
-            console.log('Missing caller or receiver');
+            console.log('>>> ERROR: Missing caller or receiver');
             return;
         }
         
-        // Получаем токен получателя
         const receiverSnap = await db.ref('users/' + receiverId).once('value');
         const receiver = receiverSnap.val();
         
-        if (!receiver || !receiver.fcmToken) {
-            console.log('No FCM token for: ' + receiverId);
+        if (!receiver) {
+            console.log('>>> ERROR: Receiver not found');
             return;
         }
         
-        // Получаем имя звонящего
+        if (!receiver.fcmToken) {
+            console.log('>>> ERROR: No FCM token for receiver');
+            return;
+        }
+        
         const callerSnap = await db.ref('users/' + callerId + '/name').once('value');
         const callerName = callerSnap.val() || 'Неизвестный';
         
-        // Отправляем push
-        await messaging.send({
+        const callType = isVideo ? 'Видеозвонок' : 'Аудиозвонок';
+        
+        // ВАЖНО: Добавляем notification для доставки в фоне
+        const message = {
+            notification: {
+                title: callerName,
+                body: callType
+            },
             data: {
                 type: 'incoming_call',
                 callId: callId,
@@ -120,19 +133,25 @@ async function sendCallNotification(callId, call) {
             },
             android: {
                 priority: 'high',
-                ttl: 30000
+                ttl: 30000,
+                notification: {
+                    sound: 'default',
+                    channelId: 'incoming_calls',
+                    priority: 'max',
+                    visibility: 'public',
+                    defaultSound: true,
+                    defaultVibrateTimings: true
+                }
             },
             token: receiver.fcmToken
-        });
+        };
         
-        console.log('CALL: ' + callerName + ' -> ' + (receiver.name || receiverId));
+        console.log('>>> Sending FCM...');
+        await messaging.send(message);
+        console.log('>>> SUCCESS: Call notification sent!');
         
     } catch (err) {
-        if (err.code === 'messaging/registration-token-not-registered') {
-            console.log('Token expired for call');
-        } else {
-            console.error('Call error: ' + err.message);
-        }
+        console.log('>>> ERROR:', err.code, err.message);
     }
 }
 
