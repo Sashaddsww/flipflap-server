@@ -21,24 +21,24 @@ app.get('/', (req, res) => {
 
 // Храним отправленные уведомления
 const sentMessages = new Set();
+const sentCalls = new Set();
 
 // Очищаем каждый час
 setInterval(() => {
     sentMessages.clear();
+    sentCalls.clear();
     console.log('Cache cleared');
 }, 60 * 60 * 1000);
 
 function startListening() {
     console.log('Starting listener...');
     
-    // Слушаем ВСЕ сообщения напрямую
+    // Слушаем сообщения
     db.ref('messages').on('child_added', (chatSnap) => {
         const chatId = chatSnap.key;
-        console.log('New chat detected: ' + chatId);
         listenToChat(chatId);
     });
 
-    // Также слушаем уже существующие чаты
     db.ref('messages').once('value', (snap) => {
         snap.forEach((chatSnap) => {
             const chatId = chatSnap.key;
@@ -46,11 +46,97 @@ function startListening() {
         });
         console.log('Listening to ' + snap.numChildren() + ' existing chats');
     });
+
+    // Слушаем звонки
+    listenToCalls();
     
     console.log('Listener started!');
 }
 
-// Храним активные listeners
+// ============ ЗВОНКИ ============
+function listenToCalls() {
+    console.log('Starting calls listener...');
+    
+    db.ref('calls').on('child_added', async (callSnap) => {
+        const call = callSnap.val();
+        const callId = callSnap.key;
+        
+        // Проверяем что это новый звонок
+        if (call.status !== 'calling') {
+            return;
+        }
+        
+        // Проверяем что не старше 30 секунд
+        const now = Date.now();
+        if (call.timestamp && (now - call.timestamp > 30000)) {
+            return;
+        }
+        
+        // Проверяем дубликаты
+        if (sentCalls.has(callId)) {
+            return;
+        }
+        sentCalls.add(callId);
+        
+        console.log('New call: ' + callId);
+        await sendCallNotification(callId, call);
+    });
+    
+    console.log('Calls listener started!');
+}
+
+async function sendCallNotification(callId, call) {
+    try {
+        const callerId = call.callerId;
+        const receiverId = call.receiverId;
+        const isVideo = call.isVideo || false;
+        
+        if (!callerId || !receiverId) {
+            console.log('Missing caller or receiver');
+            return;
+        }
+        
+        // Получаем токен получателя
+        const receiverSnap = await db.ref('users/' + receiverId).once('value');
+        const receiver = receiverSnap.val();
+        
+        if (!receiver || !receiver.fcmToken) {
+            console.log('No FCM token for: ' + receiverId);
+            return;
+        }
+        
+        // Получаем имя звонящего
+        const callerSnap = await db.ref('users/' + callerId + '/name').once('value');
+        const callerName = callerSnap.val() || 'Неизвестный';
+        
+        // Отправляем push
+        await messaging.send({
+            data: {
+                type: 'incoming_call',
+                callId: callId,
+                callerId: callerId,
+                callerName: callerName,
+                isVideo: String(isVideo)
+            },
+            android: {
+                priority: 'high',
+                ttl: 30000
+            },
+            token: receiver.fcmToken
+        });
+        
+        console.log('CALL: ' + callerName + ' -> ' + (receiver.name || receiverId));
+        
+    } catch (err) {
+        if (err.code === 'messaging/registration-token-not-registered') {
+            console.log('Token expired for call');
+        } else {
+            console.error('Call error: ' + err.message);
+        }
+    }
+}
+
+// ============ СООБЩЕНИЯ ============
 const activeListeners = new Set();
 
 function listenToChat(chatId) {
@@ -59,25 +145,21 @@ function listenToChat(chatId) {
     }
     activeListeners.add(chatId);
 
-    // Слушаем ВСЕ новые сообщения в этом чате
     db.ref('messages/' + chatId).on('child_added', (msgSnap) => {
         const message = msgSnap.val();
         const messageId = msgSnap.key;
 
-        // Проверяем что сообщение новое (не старше 60 секунд)
         const now = Date.now();
         if (message.time && (now - message.time > 60000)) {
             return;
         }
 
-        // Уникальный ключ
         const key = chatId + '_' + messageId;
         if (sentMessages.has(key)) {
             return;
         }
         sentMessages.add(key);
 
-        // Отправляем уведомление
         sendNotification(chatId, message);
     });
 }
@@ -91,7 +173,6 @@ async function sendNotification(chatId, message) {
             return;
         }
 
-        // Получаем чат
         const chatSnap = await db.ref('chats/' + chatId).once('value');
         const chat = chatSnap.val();
 
@@ -100,7 +181,6 @@ async function sendNotification(chatId, message) {
             return;
         }
 
-        // Находим получателя
         let receiverId = null;
         for (const uid in chat.members) {
             if (uid !== senderId) {
@@ -113,12 +193,10 @@ async function sendNotification(chatId, message) {
             return;
         }
 
-        // Проверяем deletedFor
         if (message.deletedFor && message.deletedFor[receiverId]) {
             return;
         }
 
-        // Получаем данные получателя
         const receiverSnap = await db.ref('users/' + receiverId).once('value');
         const receiver = receiverSnap.val();
 
@@ -127,11 +205,9 @@ async function sendNotification(chatId, message) {
             return;
         }
 
-        // Получаем имя отправителя
         const senderSnap = await db.ref('users/' + senderId + '/name').once('value');
         const senderName = senderSnap.val() || 'Сообщение';
 
-        // Отправляем
         await messaging.send({
             notification: {
                 title: senderName,
@@ -151,7 +227,7 @@ async function sendNotification(chatId, message) {
             token: receiver.fcmToken
         });
 
-        console.log('OK: ' + senderName + ' -> ' + receiver.name + ': ' + text.slice(0, 30));
+        console.log('MSG: ' + senderName + ' -> ' + receiver.name + ': ' + text.slice(0, 30));
 
     } catch (err) {
         if (err.code === 'messaging/registration-token-not-registered') {
